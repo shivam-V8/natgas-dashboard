@@ -1,14 +1,18 @@
 """
 NatGas Perp Pro Dashboard
 =========================
-A professional, real-time analytics dashboard for the Binance NATGASUSDT perpetual
-futures contract, with full Henry Hub (NG=F) momentum comparison, EIA storage
-fundamentals, and funding/OI/liquidation analytics. Read-only — no trade execution.
+A professional, real-time analytics dashboard for the Bitget NATGASUSDT perpetual
+swap, with full Henry Hub (NG=F) momentum comparison, EIA storage fundamentals,
+and funding/OI analytics. Read-only — no trade execution.
+
+Bitget is used as the perp data source because Binance returns HTTP 451 from
+US-hosted servers (e.g. Streamlit Cloud). Bitget lists the same NATGAS/USDT:USDT
+instrument and has no US geo-block on public endpoints.
 
 Run with:
     streamlit run natgas_perp_pro_dashboard.py
 
-Tech: Streamlit + Plotly + ccxt + yfinance + EIA v2 API + Binance Futures public data.
+Tech: Streamlit + Plotly + ccxt + yfinance + EIA v2 API.
 
 DISCLAIMER: NOT financial advice. Crypto futures are high-risk.
 """
@@ -117,9 +121,9 @@ st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
 # =============================================================================
 # CONSTANTS
 # =============================================================================
-BINANCE_FAPI = "https://fapi.binance.com"          # Production futures REST
+PERP_EXCHANGE_ID = "bitget"                        # ccxt exchange id for the perp source
 PERP_SYMBOL_CCXT = "NATGAS/USDT:USDT"              # ccxt unified perpetual symbol
-PERP_SYMBOL_RAW = "NATGASUSDT"                     # Raw Binance symbol for REST
+PERP_VENUE_LABEL = "Bitget"                        # human label used in UI
 HENRY_HUB_TICKER = "NG=F"                          # Yahoo Finance front-month NG futures
 EIA_SERIES_LOWER48 = "NG.NW2_EPG0_SWO_R48_BCF.W"   # Lower-48 weekly working gas
 
@@ -214,15 +218,18 @@ def fetch_henry_hub_intraday() -> Optional[pd.DataFrame]:
 
 
 def _ccxt_client():
-    """Build a public ccxt binanceusdm client for market data."""
+    """Build a public ccxt client for the perp source (Bitget swap)."""
     if not CCXT_OK:
         return None
-    return ccxt.binanceusdm({"enableRateLimit": True, "options": {"defaultType": "future"}})
+    klass = getattr(ccxt, PERP_EXCHANGE_ID, None)
+    if klass is None:
+        return None
+    return klass({"enableRateLimit": True, "options": {"defaultType": "swap"}})
 
 
 @st.cache_data(ttl=20, show_spinner=False)
 def fetch_perp_ticker() -> Dict[str, Any]:
-    """24h ticker for NATGASUSDT perp."""
+    """24h ticker for the perp via ccxt unified API."""
     out = {"ok": False, "error": None}
     ex = _ccxt_client()
     if ex is None:
@@ -248,7 +255,7 @@ def fetch_perp_ticker() -> Dict[str, Any]:
 
 @st.cache_data(ttl=30, show_spinner=False)
 def fetch_funding_now() -> Dict[str, Any]:
-    """Current funding rate + next funding time."""
+    """Current funding rate + next funding time via ccxt unified API."""
     out = {"ok": False, "error": None}
     ex = _ccxt_client()
     if ex is None:
@@ -270,39 +277,39 @@ def fetch_funding_now() -> Dict[str, Any]:
 
 @st.cache_data(ttl=120, show_spinner=False)
 def fetch_funding_history(limit: int = 50) -> Optional[pd.DataFrame]:
-    """Direct REST: last N funding settlements."""
+    """Last N funding settlements via ccxt unified API."""
+    ex = _ccxt_client()
+    if ex is None:
+        return None
     try:
-        r = requests.get(
-            f"{BINANCE_FAPI}/fapi/v1/fundingRate",
-            params={"symbol": PERP_SYMBOL_RAW, "limit": limit},
-            timeout=10,
-        )
-        r.raise_for_status()
-        data = r.json()
-        if not data:
+        rows = ex.fetch_funding_rate_history(PERP_SYMBOL_CCXT, limit=limit)
+        if not rows:
             return None
-        df = pd.DataFrame(data)
+        df = pd.DataFrame([{
+            "fundingTime": r.get("timestamp"),
+            "fundingRate": r.get("fundingRate"),
+        } for r in rows])
         df["fundingTime"] = pd.to_datetime(df["fundingTime"], unit="ms", utc=True)
-        df["fundingRate"] = df["fundingRate"].astype(float)
-        return df.sort_values("fundingTime").reset_index(drop=True)
+        df["fundingRate"] = pd.to_numeric(df["fundingRate"], errors="coerce")
+        return df.dropna().sort_values("fundingTime").reset_index(drop=True)
     except Exception:
         return None
 
 
 @st.cache_data(ttl=30, show_spinner=False)
 def fetch_open_interest() -> Dict[str, Any]:
-    """Latest OI."""
+    """Latest OI snapshot via ccxt unified API."""
     out = {"ok": False, "error": None}
+    ex = _ccxt_client()
+    if ex is None:
+        out["error"] = "ccxt unavailable"
+        return out
     try:
-        r = requests.get(
-            f"{BINANCE_FAPI}/fapi/v1/openInterest",
-            params={"symbol": PERP_SYMBOL_RAW},
-            timeout=10,
-        )
-        r.raise_for_status()
-        d = r.json()
-        out.update(ok=True, open_interest=float(d.get("openInterest", 0.0)),
-                   ts=d.get("time"))
+        oi = ex.fetch_open_interest(PERP_SYMBOL_CCXT)
+        # ccxt returns slightly different shapes per exchange; prefer base contracts amount
+        val = (oi.get("openInterestAmount") or oi.get("openInterestValue")
+               or oi.get("openInterest") or 0.0)
+        out.update(ok=True, open_interest=float(val), ts=oi.get("timestamp"))
     except Exception as e:
         out["error"] = f"{type(e).__name__}: {e}"
     return out
@@ -310,76 +317,19 @@ def fetch_open_interest() -> Dict[str, Any]:
 
 @st.cache_data(ttl=120, show_spinner=False)
 def fetch_oi_history(period: str = "5m", limit: int = 288) -> Optional[pd.DataFrame]:
-    """Open interest history for OI momentum chart (default ~24h of 5m bars)."""
-    try:
-        r = requests.get(
-            f"{BINANCE_FAPI}/futures/data/openInterestHist",
-            params={"symbol": PERP_SYMBOL_RAW, "period": period, "limit": limit},
-            timeout=10,
-        )
-        r.raise_for_status()
-        data = r.json()
-        if not data:
-            return None
-        df = pd.DataFrame(data)
-        df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
-        df["sumOpenInterest"] = df["sumOpenInterest"].astype(float)
-        df["sumOpenInterestValue"] = df["sumOpenInterestValue"].astype(float)
-        return df.sort_values("timestamp").reset_index(drop=True)
-    except Exception:
-        return None
+    """OI history — not supported on Bitget via ccxt. Returns None so the UI degrades."""
+    return None
 
 
 @st.cache_data(ttl=120, show_spinner=False)
 def fetch_long_short(endpoint: str, period: str = "5m", limit: int = 60) -> Optional[pd.DataFrame]:
-    """Generic fetcher for long/short ratio endpoints under /futures/data."""
-    try:
-        r = requests.get(
-            f"{BINANCE_FAPI}/futures/data/{endpoint}",
-            params={"symbol": PERP_SYMBOL_RAW, "period": period, "limit": limit},
-            timeout=10,
-        )
-        r.raise_for_status()
-        data = r.json()
-        if not data:
-            return None
-        df = pd.DataFrame(data)
-        df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
-        for c in ("longShortRatio", "longAccount", "shortAccount", "longPosition", "shortPosition"):
-            if c in df.columns:
-                df[c] = df[c].astype(float)
-        return df.sort_values("timestamp").reset_index(drop=True)
-    except Exception:
-        return None
+    """L/S ratio endpoints — Binance-specific, not available on Bitget. Returns None."""
+    return None
 
 
 @st.cache_data(ttl=60, show_spinner=False)
 def fetch_liquidations(limit: int = 20) -> Optional[pd.DataFrame]:
-    """
-    Recent liquidations. Binance deprecated /allLiquidationOrders for some users -
-    we try it and fall back to /forceOrders if available.
-    """
-    for path in ("/fapi/v1/allLiquidationOrders", "/fapi/v1/forceOrders"):
-        try:
-            r = requests.get(
-                f"{BINANCE_FAPI}{path}",
-                params={"symbol": PERP_SYMBOL_RAW, "limit": limit},
-                timeout=10,
-            )
-            if r.status_code != 200:
-                continue
-            data = r.json()
-            if not data:
-                continue
-            df = pd.DataFrame(data)
-            if "time" in df.columns:
-                df["time"] = pd.to_datetime(df["time"], unit="ms", utc=True)
-            for c in ("price", "origQty", "executedQty", "averagePrice"):
-                if c in df.columns:
-                    df[c] = pd.to_numeric(df[c], errors="coerce")
-            return df.sort_values("time", ascending=False).reset_index(drop=True)
-        except Exception:
-            continue
+    """Public liquidations — not exposed by Bitget. Returns None so UI shows the fallback."""
     return None
 
 
@@ -405,7 +355,7 @@ def fetch_eia_storage(api_key: str) -> Dict[str, Any]:
     """EIA v2 weekly working gas in storage - Lower 48."""
     out = {"ok": False, "error": None}
     if not api_key:
-        out["error"] = "Provide EIA API key in sidebar."
+        out["error"] = "EIA_API_KEY not configured (set in Streamlit secrets or env)."
         return out
     try:
         url = "https://api.eia.gov/v2/natural-gas/stor/wkly/data/"
@@ -723,8 +673,8 @@ def render_master_signal(sig: Dict[str, Any]) -> None:
 # =============================================================================
 st.markdown("# 🔥 NatGas Perp Pro Dashboard")
 st.caption(
-    "Live Binance NATGASUSDT perp · Henry Hub (NG=F) basis · Funding · OI · "
-    "Liquidations · EIA storage"
+    f"Live {PERP_VENUE_LABEL} NATGASUSDT perp · Henry Hub (NG=F) basis · Funding · OI · "
+    "EIA storage"
 )
 
 # Pull "always-needed" data once at the top so the header can render
@@ -747,7 +697,7 @@ with c1:
     st.markdown(
         f"""
         <div class="card">
-          <h4>NATGASUSDT (Perp)</h4>
+          <h4>NATGASUSDT Perp · {PERP_VENUE_LABEL}</h4>
           <div class="big-price {_pct_class(perp_chg)}">{_fmt_num(perp_price, 4)}</div>
           <div class="sub-price {_pct_class(perp_chg)}">
             {_arrow(perp_chg)} {_fmt_num(perp_chg, 2)}% (24h)
@@ -943,7 +893,7 @@ with tab_overview:
         st.dataframe(df_show.style.apply(_row_color, axis=1),
                      use_container_width=True, hide_index=True)
     else:
-        st.info("No recent liquidation data available (Binance restricts this endpoint).")
+        st.info(f"Public liquidation feed isn't exposed by {PERP_VENUE_LABEL}.")
 
     st.markdown("### NATGASUSDT 15m chart (last 100 candles)")
     ohlcv = perp_df_15m
