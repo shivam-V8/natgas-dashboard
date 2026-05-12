@@ -141,3 +141,16 @@ dist
 vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
 .vite/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+.python-version
+*.egg-info/
+
+# Streamlit secrets (NEVER commit)
+.streamlit/secrets.toml
+streamlit.log
